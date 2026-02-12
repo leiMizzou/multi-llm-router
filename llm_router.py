@@ -1,409 +1,571 @@
-#!/usr/bin/env python3
-"""
-🔀 multi-llm-router — Smart routing across LLM providers.
 
-Route LLM requests to the cheapest, fastest, or best provider automatically.
-Includes an OpenAI-compatible proxy server for drop-in replacement.
-
-Usage:
-    python llm_router.py route "Explain quantum computing" --strategy cost
-    python llm_router.py serve --port 8080
-    python llm_router.py providers
-    python llm_router.py config
-
-Zero dependencies (stdlib only). Python 3.8+.
-"""
-
-import argparse
-import http.server
-import json
 import os
-import re
-import sys
+import json
 import time
-import urllib.request
-import urllib.error
-from dataclasses import dataclass, field
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+import hashlib
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple, Callable
 
-__version__ = "0.1.0"
+# Configuration and State Management
+CONFIG_DIR = os.path.expanduser("~/.multi_llm_router")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+CACHE_DIR = os.path.join(CONFIG_DIR, "cache")
+STATS_FILE = os.path.join(CONFIG_DIR, "stats.json")
 
-# ─── Provider Definitions ───────────────────────────────────────────────────
+class LLMRouterConfig:
+    def __init__(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        self.config = self._load_config()
+        self.stats = self._load_stats()
 
-@dataclass
-class Provider:
-    name: str
-    base_url: str
-    api_key_env: str        # Environment variable for API key
-    models: List[str]
-    input_cost: float       # per 1M tokens
-    output_cost: float      # per 1M tokens
-    avg_latency_ms: int     # typical latency
-    quality_score: float    # 0-1 quality rating
-    api_type: str = "openai"  # openai | anthropic
-    headers_fn: Optional[str] = None
-
-DEFAULT_PROVIDERS = [
-    Provider("openai-gpt4o-mini", "https://api.openai.com/v1", "OPENAI_API_KEY",
-             ["gpt-4o-mini"], 0.15, 0.60, 300, 0.82),
-    Provider("openai-gpt4o", "https://api.openai.com/v1", "OPENAI_API_KEY",
-             ["gpt-4o"], 2.50, 10.00, 400, 0.92),
-    Provider("openai-gpt5", "https://api.openai.com/v1", "OPENAI_API_KEY",
-             ["gpt-5"], 10.00, 30.00, 600, 0.97),
-    Provider("anthropic-haiku", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY",
-             ["claude-haiku-4"], 0.25, 1.25, 250, 0.80, "anthropic"),
-    Provider("anthropic-sonnet", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY",
-             ["claude-sonnet-4"], 3.00, 15.00, 500, 0.93, "anthropic"),
-    Provider("anthropic-opus", "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY",
-             ["claude-opus-4"], 15.00, 75.00, 800, 0.98, "anthropic"),
-    Provider("deepseek-v3", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY",
-             ["deepseek-chat"], 0.27, 1.10, 350, 0.85),
-    Provider("deepseek-r1", "https://api.deepseek.com/v1", "DEEPSEEK_API_KEY",
-             ["deepseek-reasoner"], 0.55, 2.19, 500, 0.90),
-    Provider("gemini-flash", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY",
-             ["gemini-2.0-flash"], 0.10, 0.40, 200, 0.78),
-    Provider("gemini-pro", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY",
-             ["gemini-2.5-pro"], 1.25, 10.00, 450, 0.91),
-    Provider("groq-llama", "https://api.groq.com/openai/v1", "GROQ_API_KEY",
-             ["llama-3.3-70b-versatile"], 0.59, 0.79, 100, 0.80),
-]
-
-# ─── Task Classification ────────────────────────────────────────────────────
-
-TASK_PATTERNS = {
-    "coding": [r'\b(code|function|class|def |import |bug|error|debug|refactor|test|api|endpoint)\b'],
-    "reasoning": [r'\b(explain|why|analyze|compare|evaluate|think|reason|logic|proof|math)\b'],
-    "translation": [r'\b(translat|翻译|übersetze|tradui|переведи)\b'],
-    "creative": [r'\b(write|story|poem|creative|imagine|fiction|blog|essay)\b'],
-    "summarize": [r'\b(summar|tldr|brief|condense|key points|overview)\b'],
-    "chat": [r'\b(hello|hi|hey|thanks|how are)\b'],
-}
-
-def classify_task(prompt: str) -> str:
-    """Classify a prompt into a task type."""
-    prompt_lower = prompt.lower()
-    scores = {}
-    for task, patterns in TASK_PATTERNS.items():
-        score = sum(1 for p in patterns if re.search(p, prompt_lower, re.IGNORECASE))
-        if score > 0:
-            scores[task] = score
-    return max(scores, key=scores.get) if scores else "general"
-
-# ─── Routing Strategies ─────────────────────────────────────────────────────
-
-TASK_PREFERENCES = {
-    "coding": {"min_quality": 0.85, "prefer": ["openai-gpt4o", "anthropic-sonnet"]},
-    "reasoning": {"min_quality": 0.90, "prefer": ["anthropic-opus", "openai-gpt5"]},
-    "translation": {"min_quality": 0.75, "prefer": ["openai-gpt4o-mini", "deepseek-v3"]},
-    "creative": {"min_quality": 0.85, "prefer": ["anthropic-sonnet", "openai-gpt4o"]},
-    "summarize": {"min_quality": 0.75, "prefer": ["openai-gpt4o-mini", "gemini-flash"]},
-    "chat": {"min_quality": 0.70, "prefer": ["gemini-flash", "groq-llama"]},
-    "general": {"min_quality": 0.80, "prefer": ["openai-gpt4o-mini", "deepseek-v3"]},
-}
-
-def get_available_providers() -> List[Provider]:
-    """Return providers that have API keys configured."""
-    available = []
-    for p in DEFAULT_PROVIDERS:
-        key = os.environ.get(p.api_key_env, "")
-        if key:
-            available.append(p)
-    return available
-
-def route_by_cost(providers: List[Provider], task: str = "") -> List[Provider]:
-    """Route to cheapest provider that meets quality threshold."""
-    prefs = TASK_PREFERENCES.get(task, TASK_PREFERENCES["general"])
-    min_q = prefs["min_quality"]
-    eligible = [p for p in providers if p.quality_score >= min_q]
-    if not eligible:
-        eligible = providers
-    return sorted(eligible, key=lambda p: p.output_cost)
-
-def route_by_speed(providers: List[Provider], task: str = "") -> List[Provider]:
-    """Route to fastest provider."""
-    return sorted(providers, key=lambda p: p.avg_latency_ms)
-
-def route_by_quality(providers: List[Provider], task: str = "") -> List[Provider]:
-    """Route to highest quality provider."""
-    prefs = TASK_PREFERENCES.get(task, TASK_PREFERENCES["general"])
-    preferred = prefs.get("prefer", [])
-    
-    def sort_key(p):
-        priority = preferred.index(p.name) if p.name in preferred else 999
-        return (priority, -p.quality_score)
-    
-    return sorted(providers, key=sort_key)
-
-STRATEGIES = {
-    "cost": route_by_cost,
-    "speed": route_by_speed,
-    "quality": route_by_quality,
-}
-
-# ─── API Callers ─────────────────────────────────────────────────────────────
-
-def call_openai(provider: Provider, messages: List[Dict], max_tokens: int = 1000) -> Dict:
-    """Call OpenAI-compatible API."""
-    api_key = os.environ.get(provider.api_key_env, "")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    
-    body = json.dumps({
-        "model": provider.models[0],
-        "messages": messages,
-        "max_tokens": max_tokens,
-    }).encode()
-    
-    req = urllib.request.Request(
-        f"{provider.base_url}/chat/completions",
-        data=body, headers=headers,
-    )
-    
-    start = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-        latency = (time.time() - start) * 1000
-        data["_router_meta"] = {
-            "provider": provider.name,
-            "latency_ms": round(latency, 1),
-            "strategy": "routed",
-        }
-        return data
-    except Exception as e:
-        return {"error": str(e), "provider": provider.name}
-
-def call_anthropic(provider: Provider, messages: List[Dict], max_tokens: int = 1000) -> Dict:
-    """Call Anthropic API."""
-    api_key = os.environ.get(provider.api_key_env, "")
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-    }
-    
-    body = json.dumps({
-        "model": provider.models[0],
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }).encode()
-    
-    req = urllib.request.Request(
-        f"{provider.base_url}/messages",
-        data=body, headers=headers,
-    )
-    
-    start = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode())
-        latency = (time.time() - start) * 1000
-        
-        # Convert to OpenAI format
-        content = result.get("content", [{}])[0].get("text", "")
-        usage = result.get("usage", {})
+    def _load_config(self) -> Dict[str, Any]:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
         return {
-            "id": result.get("id", ""),
-            "object": "chat.completion",
-            "model": provider.models[0],
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            "models": {
+                "openai-gpt4o": {"provider": "openai", "api_key_env": "OPENAI_API_KEY", "base_url": "https://api.openai.com/v1", "model_name": "gpt-4o", "cost_input_per_token": 0.000005, "cost_output_per_token": 0.000015, "max_tokens": 4096},
+                "anthropic-claude3-opus": {"provider": "anthropic", "api_key_env": "ANTHROPIC_API_KEY", "base_url": "https://api.anthropic.com/v1", "model_name": "claude-3-opus-20240229", "cost_input_per_token": 0.000015, "cost_output_per_token": 0.000075, "max_tokens": 4096},
+                "openai-gpt35-turbo": {"provider": "openai", "api_key_env": "OPENAI_API_KEY", "base_url": "https://api.openai.com/v1", "model_name": "gpt-3.5-turbo", "cost_input_per_token": 0.0000005, "cost_output_per_token": 0.0000015, "max_tokens": 4096},
+                "anthropic-claude3-haiku": {"provider": "anthropic", "api_key_env": "ANTHROPIC_API_KEY", "base_url": "https://api.anthropic.com/v1", "model_name": "claude-3-haiku-20240307", "cost_input_per_token": 0.00000025, "cost_output_per_token": 0.00000125, "max_tokens": 4096},
             },
-            "_router_meta": {"provider": provider.name, "latency_ms": round(latency, 1)},
+            "routes": [
+                {"pattern": ".*code generation.*", "models": ["openai-gpt4o", "anthropic-claude3-opus"], "strategy": "cost_optimized"},
+                {"pattern": ".*summarization.*", "models": ["anthropic-claude3-haiku", "openai-gpt35-turbo"], "strategy": "cost_optimized"},
+                {"pattern": ".*", "models": ["openai-gpt35-turbo", "anthropic-claude3-haiku"], "strategy": "cost_optimized"} # Default route
+            ],
+            "caching": {"enabled": True, "ttl_seconds": 3600}
         }
-    except Exception as e:
-        return {"error": str(e), "provider": provider.name}
 
-def call_provider(provider: Provider, messages: List[Dict], max_tokens: int = 1000) -> Dict:
-    """Call any provider."""
-    if provider.api_type == "anthropic":
-        return call_anthropic(provider, messages, max_tokens)
-    return call_openai(provider, messages, max_tokens)
+    def _save_config(self):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.config, f, indent=4)
 
-def route_and_call(prompt: str, strategy: str = "cost", max_tokens: int = 1000) -> Dict:
-    """Route a prompt and call the best provider with fallback."""
-    available = get_available_providers()
-    if not available:
-        return {"error": "No providers configured. Set API key environment variables."}
-    
-    task = classify_task(prompt)
-    route_fn = STRATEGIES.get(strategy, route_by_cost)
-    ranked = route_fn(available, task)
-    
-    messages = [{"role": "user", "content": prompt}]
-    
-    for provider in ranked[:3]:  # Try top 3
-        result = call_provider(provider, messages, max_tokens)
-        if "error" not in result:
-            result.setdefault("_router_meta", {})["task_type"] = task
-            result["_router_meta"]["strategy"] = strategy
-            return result
-    
-    return {"error": f"All providers failed. Last: {ranked[0].name if ranked else 'none'}"}
+    def _load_stats(self) -> Dict[str, Any]:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, 'r') as f:
+                return json.load(f)
+        return {"total_cost": 0.0, "total_requests": 0, "model_stats": {}, "cache_hits": 0, "cache_misses": 0}
 
-# ─── Proxy Server ────────────────────────────────────────────────────────────
+    def _save_stats(self):
+        with open(STATS_FILE, 'w') as f:
+            json.dump(self.stats, f, indent=4)
 
-class RouterProxy(BaseHTTPRequestHandler):
-    """OpenAI-compatible proxy that routes to the best provider."""
-    
-    strategy = "cost"
-    
-    def do_POST(self):
-        if self.path == "/v1/chat/completions":
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = json.loads(self.rfile.read(content_length).decode())
-            
-            messages = body.get("messages", [])
-            max_tokens = body.get("max_tokens", 1000)
-            
-            # Extract prompt for classification
-            prompt = messages[-1].get("content", "") if messages else ""
-            
-            available = get_available_providers()
-            task = classify_task(prompt)
-            route_fn = STRATEGIES.get(self.strategy, route_by_cost)
-            ranked = route_fn(available, task)
-            
-            for provider in ranked[:3]:
-                result = call_provider(provider, messages, max_tokens)
-                if "error" not in result:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.end_headers()
-                    self.wfile.write(json.dumps(result).encode())
-                    return
-            
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "All providers failed"}).encode())
+    def get_models(self) -> Dict[str, Any]:
+        return self.config["models"]
+
+    def get_routes(self) -> List[Dict[str, Any]]:
+        return self.config["routes"]
+
+    def get_caching_config(self) -> Dict[str, Any]:
+        return self.config["caching"]
+
+    def update_model(self, model_name: str, updates: Dict[str, Any]):
+        if model_name not in self.config["models"]:
+            raise ValueError(f"Model '{model_name}' not found.")
+        self.config["models"][model_name].update(updates)
+        self._save_config()
+
+    def add_model(self, model_name: str, model_config: Dict[str, Any]):
+        if model_name in self.config["models"]:
+            raise ValueError(f"Model '{model_name}' already exists.")
+        self.config["models"][model_name] = model_config
+        self._save_config()
+
+    def delete_model(self, model_name: str):
+        if model_name not in self.config["models"]:
+            raise ValueError(f"Model '{model_name}' not found.")
+        del self.config["models"][model_name]
+        self._save_config()
+
+    def add_route(self, route_config: Dict[str, Any]):
+        self.config["routes"].append(route_config)
+        self._save_config()
+
+    def update_stats(self, model_name: str, input_tokens: int, output_tokens: int, cost: float, latency: float, success: bool):
+        self.stats["total_cost"] += cost
+        self.stats["total_requests"] += 1
+        if model_name not in self.stats["model_stats"]:
+            self.stats["model_stats"][model_name] = {"requests": 0, "cost": 0.0, "input_tokens": 0, "output_tokens": 0, "latency": 0.0, "successes": 0, "failures": 0}
+        
+        model_stat = self.stats["model_stats"][model_name]
+        model_stat["requests"] += 1
+        model_stat["cost"] += cost
+        model_stat["input_tokens"] += input_tokens
+        model_stat["output_tokens"] += output_tokens
+        model_stat["latency"] = (model_stat["latency"] * (model_stat["requests"] - 1) + latency) / model_stat["requests"] # Simple moving average
+        if success:
+            model_stat["successes"] += 1
         else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def do_GET(self):
-        if self.path == "/v1/models":
-            available = get_available_providers()
-            models = []
-            for p in available:
-                for m in p.models:
-                    models.append({"id": m, "object": "model", "owned_by": p.name})
+            model_stat["failures"] += 1
+        self._save_stats()
+
+    def record_cache_hit(self):
+        self.stats["cache_hits"] += 1
+        self._save_stats()
+
+    def record_cache_miss(self):
+        self.stats["cache_misses"] += 1
+        self._save_stats()
+
+# LLM API Clients
+class LLMClient:
+    def __init__(self, model_config: Dict[str, Any]):
+        self.provider = model_config["provider"]
+        self.api_key = os.environ.get(model_config["api_key_env"])
+        if not self.api_key:
+            raise ValueError(f"API key for {self.provider} not found in environment variable {model_config['api_key_env']}")
+        self.base_url = model_config["base_url"]
+        self.model_name = model_config["model_name"]
+        self.cost_input_per_token = model_config["cost_input_per_token"]
+        self.cost_output_per_token = model_config["cost_output_per_token"]
+        self.max_tokens = model_config.get("max_tokens", 4096) # Default to 4096 if not specified
+
+    def _calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        return (input_tokens * self.cost_input_per_token) + (output_tokens * self.cost_output_per_token)
+
+    def generate(self, prompt: str, max_tokens: int = 200, temperature: float = 0.7) -> Tuple[str, int, int, float]:
+        raise NotImplementedError
+
+class OpenAIClient(LLMClient):
+    def generate(self, prompt: str, max_tokens: int = 200, temperature: float = 0.7) -> Tuple[str, int, int, float]:
+        import requests
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature
+        }
+        start_time = time.time()
+        try:
+            response = requests.post(f"{self.base_url}/chat/completions", headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
             
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"object": "list", "data": models}).encode())
-        elif self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "version": __version__}).encode())
+            completion = data["choices"][0]["message"]["content"]
+            input_tokens = data["usage"]["prompt_tokens"]
+            output_tokens = data["usage"]["completion_tokens"]
+            latency = time.time() - start_time
+            cost = self._calculate_cost(input_tokens, output_tokens)
+            return completion, input_tokens, output_tokens, cost, latency
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"OpenAI API error: {e}")
+        except KeyError as e:
+            raise RuntimeError(f"OpenAI API response parse error: {e}, Response: {data}")
+
+class AnthropicClient(LLMClient):
+    def generate(self, prompt: str, max_tokens: int = 200, temperature: float = 0.7) -> Tuple[str, int, int, float]:
+        import requests
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01"
+        }
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature
+        }
+        start_time = time.time()
+        try:
+            response = requests.post(f"{self.base_url}/messages", headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+            
+            completion = data["content"][0]["text"]
+            input_tokens = data["usage"]["input_tokens"]
+            output_tokens = data["usage"]["output_tokens"]
+            latency = time.time() - start_time
+            cost = self._calculate_cost(input_tokens, output_tokens)
+            return completion, input_tokens, output_tokens, cost, latency
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Anthropic API error: {e}")
+        except KeyError as e:
+            raise RuntimeError(f"Anthropic API response parse error: {e}, Response: {data}")
+
+# Routing Logic
+class LLMRouter:
+    def __init__(self, config_manager: LLMRouterConfig):
+        self.config_manager = config_manager
+        self.clients: Dict[str, LLMClient] = self._initialize_clients()
+
+    def _initialize_clients(self) -> Dict[str, LLMClient]:
+        clients = {}
+        for model_name, model_config in self.config_manager.get_models().items():
+            try:
+                if model_config["provider"] == "openai":
+                    clients[model_name] = OpenAIClient(model_config)
+                elif model_config["provider"] == "anthropic":
+                    clients[model_name] = AnthropicClient(model_config)
+                # Add more providers here
+                else:
+                    print(f"Warning: Unknown provider '{model_config['provider']}' for model '{model_name}'. Skipping.")
+            except ValueError as e:
+                print(f"Error initializing client for model '{model_name}': {e}")
+            except ImportError:
+                print(f"Missing dependencies for {model_config['provider']}. Please install 'requests'.")
+        return clients
+
+    def _get_matching_models(self, prompt: str) -> List[Tuple[str, LLMClient]]:
+        import re
+        
+        matching_models = []
+        routes = self.config_manager.get_routes()
+
+        for route in routes:
+            if re.search(route["pattern"], prompt, re.IGNORECASE):
+                for model_name in route["models"]:
+                    if model_name in self.clients:
+                        matching_models.append((model_name, self.clients[model_name]))
+                return matching_models # Return models from the first matching route
+
+        return [] # Should not happen with a default route ".*"
+
+    def _select_model(self, prompt: str, strategy: str, available_models: List[Tuple[str, LLMClient]]) -> Optional[Tuple[str, LLMClient]]:
+        if not available_models:
+            return None
+
+        if strategy == "cost_optimized":
+            # Sort by total potential cost (using a placeholder token count for comparison)
+            # This is a heuristic; actual cost depends on actual input/output tokens
+            # For a more accurate cost, we'd need to estimate token counts
+            return min(available_models, key=lambda x: x[1].cost_input_per_token + x[1].cost_output_per_token)
+        elif strategy == "latency_optimized":
+            # This would require actual latency stats per model, which we don't have dynamically here
+            # For now, we'll just pick the first available if latency is the strategy.
+            # In a real system, you'd query historical stats or ping models.
+            print("Warning: Latency-optimized strategy not fully implemented. Falling back to first available.")
+            return available_models[0]
         else:
-            self.send_response(404)
-            self.end_headers()
-    
-    def log_message(self, format, *args):
-        sys.stderr.write(f"[router] {args[0]}\n")
+            # Default to first available if strategy is unknown
+            print(f"Warning: Unknown strategy '{strategy}'. Falling back to first available.")
+            return available_models[0]
 
-# ─── Output ──────────────────────────────────────────────────────────────────
+    def _get_route_strategy(self, prompt: str) -> str:
+        import re
+        routes = self.config_manager.get_routes()
+        for route in routes:
+            if re.search(route["pattern"], prompt, re.IGNORECASE):
+                return route["strategy"]
+        return "cost_optimized" # Default strategy if no route matches
 
-BOLD = "\033[1m"
-DIM = "\033[2m"
-RESET = "\033[0m"
-GREEN = "\033[32m"
-RED = "\033[31m"
-YELLOW = "\033[33m"
-CYAN = "\033[36m"
+    def route(self, prompt: str, max_tokens: int = 200, temperature: float = 0.7) -> Tuple[str, str, int, int, float, float]:
+        caching_config = self.config_manager.get_caching_config()
+        if caching_config["enabled"]:
+            cached_response = self._get_cached_response(prompt)
+            if cached_response:
+                self.config_manager.record_cache_hit()
+                return cached_response[0], "cache", cached_response[1], cached_response[2], 0.0, 0.0 # completion, model_name, input_tokens, output_tokens, cost, latency
+            self.config_manager.record_cache_miss()
 
-def format_providers(providers: List[Provider], available: List[str]) -> str:
-    lines = []
-    lines.append(f"\n{BOLD}🔀 multi-llm-router v{__version__} — Providers{RESET}")
-    lines.append(f"{DIM}{'─' * 75}{RESET}")
-    lines.append(f"  {'Provider':<22} {'Model':<25} {'Out/1M':>8} {'Latency':>8} {'Quality':>8} {'Status':>8}")
-    lines.append(f"  {'─' * 72}")
-    
-    for p in DEFAULT_PROVIDERS:
-        status = f"{GREEN}✓{RESET}" if p.name in available else f"{RED}✗{RESET}"
-        lines.append(f"  {p.name:<22} {p.models[0]:<25} ${p.output_cost:<7.2f} {p.avg_latency_ms:>6}ms {p.quality_score:>7.2f} {status:>8}")
-    
-    lines.append(f"\n{DIM}  Set API keys via environment variables to enable providers.{RESET}\n")
-    return '\n'.join(lines)
+        matching_models_with_clients = self._get_matching_models(prompt)
+        if not matching_models_with_clients:
+            raise RuntimeError("No models configured or matched for the given prompt.")
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+        strategy = self._get_route_strategy(prompt)
+        
+        # Apply strategy to get an ordered list of models for fallback
+        if strategy == "cost_optimized":
+            # Sort all matched models by their per-token cost for fallback
+            ordered_models = sorted(matching_models_with_clients, key=lambda x: x[1].cost_input_per_token + x[1].cost_output_per_token)
+        else:
+            # For other strategies or if strategy is not specifically cost/latency based,
+            # use the order defined in the route.
+            # Reconstruct based on route order for consistent fallback.
+            ordered_models = []
+            route_models_names = []
+            for route in self.config_manager.get_routes():
+                if import re; re.search(route["pattern"], prompt, re.IGNORECASE):
+                    route_models_names = route["models"]
+                    break
+            
+            for model_name in route_models_names:
+                if model_name in self.clients:
+                    ordered_models.append((model_name, self.clients[model_name]))
+            
+            # Ensure all matching clients are included, even if not explicitly in the route's ordered list
+            # This handles cases where _get_matching_models might return more than what's strictly in a route's 'models' list
+            # (though the current implementation of _get_matching_models should align them).
+            # For robustness, we could merge and deduplicate.
+            
+            # For now, let's ensure models in ordered_models are unique and use the strategy's preference for primary
+            # and then fall back based on its relative cost or just sequential order.
+            # Simplified: the selection logic will pick the *best* from `ordered_models` based on strategy,
+            # and then fallback will iterate through the rest of `ordered_models`.
+
+
+        last_error = None
+        for model_name, client in ordered_models:
+            print(f"Attempting to use model: {model_name}...")
+            try:
+                completion, input_tokens, output_tokens, cost, latency = client.generate(prompt, max_tokens, temperature)
+                self.config_manager.update_stats(model_name, input_tokens, output_tokens, cost, latency, success=True)
+                if caching_config["enabled"]:
+                    self._cache_response(prompt, completion, input_tokens, output_tokens)
+                return completion, model_name, input_tokens, output_tokens, cost, latency
+            except Exception as e:
+                last_error = e
+                self.config_manager.update_stats(model_name, 0, 0, 0.0, 0.0, success=False)
+                print(f"Model '{model_name}' failed: {e}. Attempting fallback...")
+        
+        raise RuntimeError(f"All models failed for the prompt. Last error: {last_error}")
+
+    def _get_cache_file_path(self, prompt: str) -> str:
+        prompt_hash = hashlib.md5(prompt.encode('utf-8')).hexdigest()
+        return os.path.join(CACHE_DIR, f"{prompt_hash}.json")
+
+    def _get_cached_response(self, prompt: str) -> Optional[Tuple[str, int, int]]:
+        cache_file = self._get_cache_file_path(prompt)
+        if os.path.exists(cache_file):
+            with open(cache_file, 'r') as f:
+                data = json.load(f)
+            
+            ttl = self.config_manager.get_caching_config()["ttl_seconds"]
+            if (time.time() - data["timestamp"]) < ttl:
+                return data["completion"], data["input_tokens"], data["output_tokens"]
+            else:
+                os.remove(cache_file) # Cache expired
+        return None
+
+    def _cache_response(self, prompt: str, completion: str, input_tokens: int, output_tokens: int):
+        cache_file = self._get_cache_file_path(prompt)
+        data = {
+            "prompt": prompt,
+            "completion": completion,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "timestamp": time.time()
+        }
+        with open(cache_file, 'w') as f:
+            json.dump(data, f, indent=4)
+
+    def clear_cache(self):
+        for filename in os.listdir(CACHE_DIR):
+            file_path = os.path.join(CACHE_DIR, filename)
+            try:
+                if os.path.isfile(file_path):
+                    os.unlink(file_path)
+            except Exception as e:
+                print(f"Error deleting cache file {file_path}: {e}")
+        print("Cache cleared.")
+
+# CLI Interface
+def print_help():
+    print("""
+Usage: python llm_router.py <command> [options]
+
+Commands:
+  route <prompt>                - Route a prompt to an LLM based on configuration.
+  config list [models|routes]   - List current models or routing rules.
+  config add model <name> <json> - Add a new model configuration.
+  config update model <name> <json> - Update an existing model configuration.
+  config delete model <name>    - Delete a model configuration.
+  config add route <json>       - Add a new routing rule.
+  stats                         - Display usage statistics.
+  cache clear                   - Clear the response cache.
+  cache list                    - List cached prompts (shows hashes).
+  help                          - Display this help message.
+
+Examples:
+  python llm_router.py route "Generate python code for a quicksort algorithm."
+  python llm_router.py route "Summarize this article: ..." --max_tokens 100
+  python llm_router.py config list models
+  python llm_router.py config add model my-ollama '{"provider": "openai", "api_key_env": "OLLAMA_API_KEY", "base_url": "http://localhost:11434/v1", "model_name": "llama2", "cost_input_per_token": 0.0, "cost_output_per_token": 0.0, "max_tokens": 4096}'
+  python llm_router.py stats
+""")
 
 def main():
-    parser = argparse.ArgumentParser(prog="llm-router", description="🔀 Smart routing across LLM providers")
-    sub = parser.add_subparsers(dest="command")
-    
-    # Route
-    route_p = sub.add_parser("route", help="Route a prompt to the best provider")
-    route_p.add_argument("prompt", help="The prompt text")
-    route_p.add_argument("--strategy", "-s", choices=["cost", "speed", "quality"], default="cost")
-    route_p.add_argument("--max-tokens", "-t", type=int, default=1000)
-    route_p.add_argument("--json", action="store_true")
-    
-    # Serve
-    serve_p = sub.add_parser("serve", help="Start OpenAI-compatible proxy server")
-    serve_p.add_argument("--port", "-p", type=int, default=8080)
-    serve_p.add_argument("--strategy", "-s", choices=["cost", "speed", "quality"], default="cost")
-    
-    # Providers
-    sub.add_parser("providers", help="List configured providers")
-    
-    # Classify
-    cls_p = sub.add_parser("classify", help="Classify a prompt's task type")
-    cls_p.add_argument("prompt")
-    
-    parser.add_argument("--version", "-v", action="version", version=f"llm-router {__version__}")
-    
-    args = parser.parse_args()
-    
-    if args.command == "providers":
-        available = [p.name for p in get_available_providers()]
-        print(format_providers(DEFAULT_PROVIDERS, available))
-    
-    elif args.command == "classify":
-        task = classify_task(args.prompt)
-        prefs = TASK_PREFERENCES.get(task, {})
-        print(f"Task: {task}")
-        print(f"Min quality: {prefs.get('min_quality', 0.80)}")
-        print(f"Preferred: {', '.join(prefs.get('prefer', []))}")
-    
-    elif args.command == "route":
-        result = route_and_call(args.prompt, args.strategy, args.max_tokens)
-        if args.json:
-            print(json.dumps(result, indent=2))
-        elif "error" in result:
-            print(f"{RED}Error: {result['error']}{RESET}", file=sys.stderr)
-            sys.exit(1)
-        else:
-            meta = result.get("_router_meta", {})
-            content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-            print(f"{DIM}[{meta.get('provider', '?')} | {meta.get('task_type', '?')} | {meta.get('latency_ms', 0):.0f}ms]{RESET}")
-            print(content)
-    
-    elif args.command == "serve":
-        RouterProxy.strategy = args.strategy
-        server = HTTPServer(("0.0.0.0", args.port), RouterProxy)
-        print(f"{BOLD}🔀 llm-router proxy{RESET}")
-        print(f"  Listening on http://0.0.0.0:{args.port}")
-        print(f"  Strategy: {args.strategy}")
-        print(f"  Endpoints: /v1/chat/completions, /v1/models, /health")
-        print(f"  {DIM}Use as OpenAI base_url: http://localhost:{args.port}/v1{RESET}")
+    import sys
+    config_manager = LLMRouterConfig()
+    router = LLMRouter(config_manager)
+
+    args = sys.argv[1:]
+
+    if not args or args[0] == "help":
+        print_help()
+        return
+
+    command = args[0]
+
+    if command == "route":
+        if len(args) < 2:
+            print("Error: 'route' command requires a prompt.")
+            print_help()
+            return
+        
+        prompt = args[1]
+        max_tokens = 200
+        temperature = 0.7
+
+        # Parse optional arguments
+        i = 2
+        while i < len(args):
+            if args[i] == "--max_tokens":
+                if i + 1 < len(args):
+                    max_tokens = int(args[i+1])
+                    i += 1
+                else:
+                    print("Error: --max_tokens requires a value.")
+                    return
+            elif args[i] == "--temperature":
+                if i + 1 < len(args):
+                    temperature = float(args[i+1])
+                    i += 1
+                else:
+                    print("Error: --temperature requires a value.")
+                    return
+            i += 1
+
         try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down...")
-    
+            completion, model_name, input_tokens, output_tokens, cost, latency = router.route(prompt, max_tokens, temperature)
+            print("\n--- LLM Router Response ---")
+            print(f"Model Used: {model_name}")
+            print(f"Input Tokens: {input_tokens}")
+            print(f"Output Tokens: {output_tokens}")
+            print(f"Cost: ${cost:.8f}")
+            print(f"Latency: {latency:.2f}s")
+            print("\nCompletion:")
+            print(completion)
+        except RuntimeError as e:
+            print(f"Error routing prompt: {e}")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+
+    elif command == "config":
+        if len(args) < 2:
+            print("Error: 'config' command requires a subcommand.")
+            print_help()
+            return
+        
+        subcommand = args[1]
+
+        if subcommand == "list":
+            if len(args) < 3:
+                print("Error: 'config list' requires 'models' or 'routes'.")
+                print_help()
+                return
+            target = args[2]
+            if target == "models":
+                print(json.dumps(config_manager.get_models(), indent=4))
+            elif target == "routes":
+                print(json.dumps(config_manager.get_routes(), indent=4))
+            else:
+                print(f"Error: Unknown config list target '{target}'. Use 'models' or 'routes'.")
+                print_help()
+        
+        elif subcommand == "add":
+            if len(args) < 4:
+                print("Error: 'config add' requires 'model' or 'route' and data.")
+                print_help()
+                return
+            target = args[2]
+            try:
+                data = json.loads(args[3])
+                if target == "model":
+                    name = data.pop("name") # Expect name in the JSON for 'add model'
+                    config_manager.add_model(name, data)
+                    print(f"Model '{name}' added successfully.")
+                elif target == "route":
+                    config_manager.add_route(data)
+                    print("Route added successfully.")
+                else:
+                    print(f"Error: Unknown config add target '{target}'. Use 'model' or 'route'.")
+            except json.JSONDecodeError:
+                print("Error: Invalid JSON provided.")
+            except ValueError as e:
+                print(f"Error: {e}")
+
+        elif subcommand == "update":
+            if len(args) < 5 or args[2] != "model":
+                print("Error: 'config update model <name> <json>'")
+                print_help()
+                return
+            model_name = args[3]
+            try:
+                updates = json.loads(args[4])
+                config_manager.update_model(model_name, updates)
+                print(f"Model '{model_name}' updated successfully.")
+            except json.JSONDecodeError:
+                print("Error: Invalid JSON provided.")
+            except ValueError as e:
+                print(f"Error: {e}")
+
+        elif subcommand == "delete":
+            if len(args) < 4 or args[2] != "model":
+                print("Error: 'config delete model <name>'")
+                print_help()
+                return
+            model_name = args[3]
+            try:
+                config_manager.delete_model(model_name)
+                print(f"Model '{model_name}' deleted successfully.")
+            except ValueError as e:
+                print(f"Error: {e}")
+
+        else:
+            print(f"Error: Unknown config subcommand '{subcommand}'.")
+            print_help()
+
+    elif command == "stats":
+        stats = config_manager.stats
+        print("\n--- LLM Usage Statistics ---")
+        print(f"Total Requests: {stats.get('total_requests', 0)}")
+        print(f"Total Cost: ${stats.get('total_cost', 0.0):.8f}")
+        print(f"Cache Hits: {stats.get('cache_hits', 0)}")
+        print(f"Cache Misses: {stats.get('cache_misses', 0)}")
+        print("\nModel Specific Stats:")
+        if not stats.get('model_stats'):
+            print("  No model usage data yet.")
+        for model_name, model_stats in stats.get('model_stats', {}).items():
+            print(f"  Model: {model_name}")
+            print(f"    Requests: {model_stats.get('requests', 0)}")
+            print(f"    Successes: {model_stats.get('successes', 0)}")
+            print(f"    Failures: {model_stats.get('failures', 0)}")
+            print(f"    Cost: ${model_stats.get('cost', 0.0):.8f}")
+            print(f"    Input Tokens: {model_stats.get('input_tokens', 0)}")
+            print(f"    Output Tokens: {model_stats.get('output_tokens', 0)}")
+            print(f"    Avg Latency: {model_stats.get('latency', 0.0):.2f}s")
+            print("-" * 30)
+
+    elif command == "cache":
+        if len(args) < 2:
+            print("Error: 'cache' command requires a subcommand.")
+            print_help()
+            return
+        
+        subcommand = args[1]
+        if subcommand == "clear":
+            router.clear_cache()
+        elif subcommand == "list":
+            print("\n--- Cached Prompts ---")
+            if not os.listdir(CACHE_DIR):
+                print("  Cache is empty.")
+            for filename in os.listdir(CACHE_DIR):
+                if filename.endswith(".json"):
+                    file_path = os.path.join(CACHE_DIR, filename)
+                    try:
+                        with open(file_path, 'r') as f:
+                            data = json.load(f)
+                        timestamp_dt = datetime.fromtimestamp(data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
+                        print(f"  Hash: {filename.replace('.json', '')}")
+                        print(f"    Prompt: {data['prompt'][:70]}...")
+                        print(f"    Cached at: {timestamp_dt}")
+                        print("-" * 30)
+                    except Exception as e:
+                        print(f"  Error reading cache file {filename}: {e}")
+        else:
+            print(f"Error: Unknown cache subcommand '{subcommand}'.")
+            print_help()
+
     else:
-        parser.print_help()
+        print(f"Error: Unknown command '{command}'.")
+        print_help()
 
 if __name__ == "__main__":
     main()
